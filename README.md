@@ -22,7 +22,7 @@ $ npm run start:prod
 ## Database
 
 ```sql
-CREATE SCHEMA content IF NOT EXISTS
+CREATE SCHEMA generator IF NOT EXISTS
 ```
 
 ## Migrations
@@ -38,9 +38,3 @@ $ npm run build
 # run all migrations
 $ npm run migration:run
 ```
-
-#### Prettier configuration
-
-Webstorm IDE settings - Prettier - Manual Prettier configuration - Prettier package (`\node_modules\prettier`)
-
-Check mark 'Run on save'

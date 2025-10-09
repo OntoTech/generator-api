@@ -1,5 +1,5 @@
 import { HttpException, Injectable, NotFoundException } from '@nestjs/common';
-import { DataSource, QueryFailedError, QueryRunner, Table } from 'typeorm';
+import { DataSource, QueryFailedError, Table } from 'typeorm';
 import { Service } from '../service/Service';
 import { env } from '../util/env';
 import { ModelService } from '../model/model.service';
@@ -7,41 +7,71 @@ import { IModel, ModelItem, ValidationResult } from '../util/types';
 import { CreateGeneratorDto } from './dto/create-generator.dto';
 import { UpdateGeneratorDto } from './dto/update-generator.dto';
 import { SearchGeneratorDto } from './dto/search-generator.dto';
+import { RelationService } from '../relation/relation.service';
 
 @Injectable()
 export class GeneratorService extends Service {
   constructor(
     private dataSource: DataSource,
     private readonly modelService: ModelService,
+    private readonly relationService: RelationService,
   ) {
     super();
   }
 
   async create(modelCode: string, createGeneratorDto: CreateGeneratorDto) {
     const modelData = await this.modelService.findOne(modelCode);
-    const validationResult = await this.validateModelData(modelData.data, createGeneratorDto);
+    const plainObject = {};
 
-    if (!validationResult.isValid) {
-      throw new HttpException(
-        {
-          errors: validationResult.errors,
-        },
-        500,
-      );
+    for (const [key, value] of Object.entries(createGeneratorDto)) {
+      if (typeof value === 'object') {
+        continue;
+      }
+
+      plainObject[key] = value;
     }
 
-    const queryRunner = this.dataSource.createQueryRunner();
-    await queryRunner.connect();
+    const rootModelItem = modelData.data.items.find((item) => item.props.description.includes('root'));
 
-    try {
-      await this.createTableIfNotExists(queryRunner, modelData.code);
-      const result = await this.createRecord(queryRunner, modelData.data, createGeneratorDto);
-      await queryRunner.release();
-      return result;
-    } catch (err) {
-      await queryRunner.release();
-      throw err;
-    }
+    await this.createTable(rootModelItem.props.code);
+
+    const rootObject = await this.createRecord(rootModelItem.props.code, plainObject);
+
+    const walkObject = async (data: any, parentId: string) => {
+      for (const [key, value] of Object.entries(data)) {
+        if (Array.isArray(value)) {
+          const targetModelItem = modelData.data.items.find((item) => item.props.code === key);
+
+          const modelRelation = modelData.data.relations.find(
+            ({ type, to }) => type === 'base:object-object' && to === targetModelItem.id,
+          );
+
+          await this.createTable(targetModelItem.props.code);
+
+          const sourceModelItem = modelData.data.items.find((item) => item.id === modelRelation.from);
+
+          for (const item of value) {
+            const newRecord = await this.createRecord(targetModelItem.props.code, item);
+
+            await this.relationService.create({
+              fromId: parentId,
+              toId: newRecord.id,
+              baseType: sourceModelItem.baseModelItemId,
+              objectType: sourceModelItem.type,
+              relationType: modelRelation.type,
+              relatedBaseType: targetModelItem.baseModelItemId,
+              relatedObjectType: targetModelItem.type,
+            });
+
+            await walkObject(item, newRecord.id);
+          }
+        } else if (typeof value === 'object') {
+          await walkObject(value, parentId);
+        }
+      }
+    };
+
+    await walkObject(createGeneratorDto, rootObject.id);
   }
 
   async findAll(tableName: string) {
@@ -212,7 +242,10 @@ export class GeneratorService extends Service {
     }
   }
 
-  private async createTableIfNotExists(queryRunner: QueryRunner, tableName: string) {
+  async createTable(tableName: string) {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+
     try {
       await queryRunner.createTable(
         new Table({
@@ -225,11 +258,6 @@ export class GeneratorService extends Service {
               isUnique: true,
               generationStrategy: 'uuid',
               default: 'gen_random_uuid()',
-            },
-            {
-              name: 'code',
-              type: 'varchar',
-              isUnique: true,
             },
             {
               name: 'data',
@@ -250,26 +278,34 @@ export class GeneratorService extends Service {
         }),
         true,
       );
+      await queryRunner.release();
     } catch (e) {
+      await queryRunner.release();
       this.log.error({ error: e.message }, `Error during create table ${tableName}`);
       throw new HttpException(`Error during create table ${tableName}: ${e.message}`, 500);
     }
   }
 
-  private async createRecord(queryRunner: QueryRunner, modelData: IModel, createGeneratorDto: any) {
+  private async createRecord(tableName: string, createGeneratorDto: any) {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+
     try {
-      const res = await queryRunner.manager
+      const result = await queryRunner.manager
         .createQueryBuilder()
         .insert()
-        .into(`${env.DATABASE_SCHEMA}.${modelData.code}`)
-        .values({ data: createGeneratorDto, code: createGeneratorDto.code })
+        .into(`${env.DATABASE_SCHEMA}.${tableName}`)
+        .values({ data: createGeneratorDto })
         .returning('*')
         .execute();
 
+      await queryRunner.release();
+
       return {
-        ...res.raw[0],
+        ...result.raw[0],
       };
     } catch (err) {
+      await queryRunner.release();
       this.log.error({ error: err.message }, 'Error during insert record');
 
       if (err instanceof QueryFailedError && err.driverError.code === '23505') {
