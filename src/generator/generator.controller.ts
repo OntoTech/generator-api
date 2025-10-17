@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Body, Param, Delete, Put, Patch, ParseArrayPipe } from '@nestjs/common';
+import { Controller, Get, Post, Body, Param, Delete, Put, Patch, Query } from '@nestjs/common';
 import { GeneratorService } from './generator.service';
 import { CreateGeneratorDto } from './dto/create-generator.dto';
 import { UpdateGeneratorDto } from './dto/update-generator.dto';
@@ -28,8 +28,12 @@ export class GeneratorController {
   }
 
   @Get(':modelCode/:objectCode')
-  findOne(@Param('modelCode') modelCode: string, @Param('objectCode') objectCode: string) {
-    return this.generatorService.findOne(modelCode, objectCode);
+  findOne(
+    @Param('modelCode') modelCode: string,
+    @Param('objectCode') objectCode: string,
+    @Query('nested') nested: string,
+  ) {
+    return this.generatorService.findOne(modelCode, objectCode, nested === 'true');
   }
 
   @Put(':modelCode/:objectCode')

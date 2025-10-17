@@ -1,5 +1,5 @@
 import { HttpException, Injectable, NotFoundException } from '@nestjs/common';
-import { DataSource, QueryFailedError, Table } from 'typeorm';
+import { DataSource, QueryFailedError, Repository, Table } from 'typeorm';
 import { Service } from '../service/Service';
 import { env } from '../util/env';
 import { ModelService } from '../model/model.service';
@@ -8,15 +8,20 @@ import { CreateGeneratorDto } from './dto/create-generator.dto';
 import { UpdateGeneratorDto } from './dto/update-generator.dto';
 import { SearchGeneratorDto } from './dto/search-generator.dto';
 import { RelationService } from '../relation/relation.service';
+import { Relation } from '../relation/entities/relation.entity';
+import { Model } from '../model/entities/model.entity';
 
 @Injectable()
 export class GeneratorService extends Service {
+  private relationRepository: Repository<Relation>;
+
   constructor(
     private dataSource: DataSource,
     private readonly modelService: ModelService,
     private readonly relationService: RelationService,
   ) {
     super();
+    this.relationRepository = this.dataSource.getRepository(Relation);
   }
 
   async create(modelCode: string, createGeneratorDto: CreateGeneratorDto) {
@@ -113,10 +118,12 @@ export class GeneratorService extends Service {
     }
   }
 
-  async findOne(tableName: string, code: string) {
+  async findOne(modelCode: string, code: string, nested?: boolean) {
+    const modelData = await this.modelService.findOne(modelCode);
+
     try {
       const res = await this.dataSource.manager.query(
-        `SELECT * FROM ${env.DATABASE_SCHEMA}."${tableName}" WHERE code = $1`,
+        `SELECT * FROM ${env.DATABASE_SCHEMA}."${modelCode}" WHERE code = $1`,
         [code],
       );
 
@@ -124,7 +131,13 @@ export class GeneratorService extends Service {
         throw new NotFoundException();
       }
 
-      return res[0];
+      const rootObject = res[0];
+
+      if (nested) {
+        return this.findNested(rootObject, modelData);
+      }
+
+      return rootObject;
     } catch (err) {
       this.log.error({ error: err.message }, 'Error during select record');
 
@@ -134,6 +147,40 @@ export class GeneratorService extends Service {
 
       throw new HttpException(`Error during select record: ${err.message}`, 500);
     }
+  }
+
+  async findNested(root: any, modelData: Model) {
+    const result = { ...root };
+
+    const _findNested = async (object: any) => {
+      const objectId = object.id;
+      const relations = await this.relationRepository.find({ where: { fromId: objectId } });
+
+      for (const relation of relations) {
+        const modelItem = modelData.data.items.find(
+          (item) => item.type === relation.relatedObjectType && item.baseModelItemId === relation.relatedBaseType,
+        );
+
+        const relatedRecords = await this.dataSource.manager.query(
+          `SELECT * FROM ${env.DATABASE_SCHEMA}."${modelItem.props.code}" WHERE id = $1`,
+          [relation.toId],
+        );
+
+        if (!Array.isArray(result[modelItem.props.code])) {
+          result.data[modelItem.props.code] = [];
+        }
+
+        const relatedRecord = { ...relatedRecords[0].data, id: relatedRecords[0].id };
+
+        result.data[modelItem.props.code].push(relatedRecord);
+
+        await _findNested(relatedRecord);
+      }
+    };
+
+    await _findNested(root);
+
+    return result;
   }
 
   async update(tableName: string, code: string, updateGeneratorDto: UpdateGeneratorDto) {
@@ -260,6 +307,12 @@ export class GeneratorService extends Service {
               default: 'gen_random_uuid()',
             },
             {
+              name: 'code',
+              type: 'varchar',
+              isUnique: true,
+              isNullable: true,
+            },
+            {
               name: 'data',
               type: 'jsonb',
               isNullable: false,
@@ -295,7 +348,7 @@ export class GeneratorService extends Service {
         .createQueryBuilder()
         .insert()
         .into(`${env.DATABASE_SCHEMA}.${tableName}`)
-        .values({ data: createGeneratorDto })
+        .values({ data: createGeneratorDto, code: createGeneratorDto.code || null })
         .returning('*')
         .execute();
 
