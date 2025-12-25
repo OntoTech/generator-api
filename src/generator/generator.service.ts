@@ -48,7 +48,7 @@ export class GeneratorService extends Service {
           const targetModelItem = modelData.data.items.find((item) => item.props.code === key);
 
           const modelRelation = modelData.data.relations.find(
-            ({ type, to }) => type === 'base:object-object' && to === targetModelItem.id,
+            ({ type, to }) => type === 'base:object--object' && to === targetModelItem.id,
           );
 
           await this.createTable(targetModelItem.props.code);

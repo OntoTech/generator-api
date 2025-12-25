@@ -14,7 +14,7 @@ export interface ModelItem {
   };
 }
 
-export type ModelRelationType = 'base:object-object' | 'base:object--attribute';
+export type ModelRelationType = 'base:object--object' | 'base:object--attribute';
 
 export interface ModelRelation {
   id: string;
