@@ -32,6 +32,9 @@ class ModelItemDto {
 
   @ApiProperty()
   baseModelItemId: string;
+
+  @ApiProperty()
+  baseType: string;
 }
 
 class ModelRelationPropsDto {

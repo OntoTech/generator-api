@@ -7,6 +7,7 @@ export interface ModelItem {
   id: string;
   type: string;
   baseModelItemId: string;
+  baseType: string;
   props: {
     code: string;
     name?: string;

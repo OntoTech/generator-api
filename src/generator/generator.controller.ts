@@ -3,6 +3,7 @@ import { GeneratorService } from './generator.service';
 import { CreateGeneratorDto } from './dto/create-generator.dto';
 import { UpdateGeneratorDto } from './dto/update-generator.dto';
 import { SearchGeneratorDto } from './dto/search-generator.dto';
+import { ApiQuery } from '@nestjs/swagger';
 
 @Controller('object')
 export class GeneratorController {
@@ -14,8 +15,9 @@ export class GeneratorController {
   }
 
   @Get(':modelCode/list')
-  findAll(@Param('modelCode') modelCode: string) {
-    return this.generatorService.findAll(modelCode);
+  @ApiQuery({ name: 'nested', required: false, type: String })
+  findAll(@Param('modelCode') modelCode: string, @Query('nested') nested?: string) {
+    return this.generatorService.findAll(modelCode, nested === 'true');
   }
 
   @Post(':modelCode/search')
@@ -28,10 +30,11 @@ export class GeneratorController {
   }
 
   @Get(':modelCode/:objectCode')
+  @ApiQuery({ name: 'nested', required: false, type: String })
   findOne(
     @Param('modelCode') modelCode: string,
     @Param('objectCode') objectCode: string,
-    @Query('nested') nested: string,
+    @Query('nested') nested?: string,
   ) {
     return this.generatorService.findOne(modelCode, objectCode, nested === 'true');
   }

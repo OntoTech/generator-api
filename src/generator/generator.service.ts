@@ -79,16 +79,30 @@ export class GeneratorService extends Service {
     await walkObject(createGeneratorDto, rootObject.id);
   }
 
-  async findAll(tableName: string) {
+  async findAll(modelCode: string, nested?: boolean) {
+    const modelData = await this.modelService.findOne(modelCode);
+    const rootModelItem = modelData.data.items.find((item) => item.props.description.includes('root'));
+    const tableName = rootModelItem.props.code;
+
     try {
       const totalRes = await this.dataSource.manager.query(
         `SELECT COUNT(*) FROM ${env.DATABASE_SCHEMA}."${tableName}"`,
       );
 
-      const res = await this.dataSource.manager.query(`SELECT * FROM ${env.DATABASE_SCHEMA}."${tableName}"`);
+      let objects = await this.dataSource.manager.query(`SELECT * FROM ${env.DATABASE_SCHEMA}."${tableName}"`);
+
+      if (nested) {
+        const fullObjects = [];
+
+        for (const object of objects) {
+          fullObjects.push(await this.findNested(object, modelData));
+        }
+
+        objects = fullObjects;
+      }
 
       return {
-        items: res,
+        items: objects,
         total: +totalRes[0].count,
       };
     } catch (err) {
@@ -121,23 +135,36 @@ export class GeneratorService extends Service {
   async findOne(modelCode: string, code: string, nested?: boolean) {
     const modelData = await this.modelService.findOne(modelCode);
 
+    const root = modelData.data.items.find((item) => item.props.description.includes('root'));
+
     try {
-      const res = await this.dataSource.manager.query(
-        `SELECT * FROM ${env.DATABASE_SCHEMA}."${modelCode}" WHERE code = $1`,
+      const objects = await this.dataSource.manager.query(
+        `SELECT * FROM ${env.DATABASE_SCHEMA}."${root.props.code}" WHERE code = $1`,
         [code],
       );
 
-      if (!res.length) {
+      if (!objects.length) {
         throw new NotFoundException();
       }
 
-      const rootObject = res[0];
+      const rootObject = objects[0];
 
       if (nested) {
         return this.findNested(rootObject, modelData);
       }
 
-      return rootObject;
+      const { data, ...rest } = rootObject;
+      const resultObject = { ...rest, data: {} };
+
+      for (const item of modelData.data.items) {
+        if (item.props.code.includes('root')) continue;
+
+        if (item.baseType === 'base:attribute' && data.hasOwnProperty(item.props.code)) {
+          resultObject.data[item.props.code] = data[item.props.code];
+        }
+      }
+
+      return resultObject;
     } catch (err) {
       this.log.error({ error: err.message }, 'Error during select record');
 
@@ -160,6 +187,8 @@ export class GeneratorService extends Service {
         const modelItem = modelData.data.items.find(
           (item) => item.type === relation.relatedObjectType && item.baseModelItemId === relation.relatedBaseType,
         );
+
+        if (!modelItem) continue;
 
         const relatedRecords = await this.dataSource.manager.query(
           `SELECT * FROM ${env.DATABASE_SCHEMA}."${modelItem.props.code}" WHERE id = $1`,
