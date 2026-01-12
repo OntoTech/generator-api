@@ -195,7 +195,7 @@ export class GeneratorService extends Service {
           [relation.toId],
         );
 
-        if (!Array.isArray(result[modelItem.props.code])) {
+        if (!Array.isArray(result.data[modelItem.props.code])) {
           result.data[modelItem.props.code] = [];
         }
 
