@@ -181,7 +181,7 @@ export class GeneratorService extends Service {
 
     const _findNested = async (object: any) => {
       const objectId = object.id;
-      const relations = await this.relationRepository.find({ where: { fromId: objectId } });
+      const relations = await this.relationRepository.find({ where: { fromId: objectId, isDeleted: false } });
 
       for (const relation of relations) {
         const modelItem = modelData.data.items.find(
@@ -251,6 +251,23 @@ export class GeneratorService extends Service {
 
   async remove(tableName: string, code: string) {
     try {
+      const objects = await this.dataSource.manager.query(
+        `SELECT * FROM ${env.DATABASE_SCHEMA}."${tableName}" WHERE code = $1`,
+        [code],
+      );
+
+      if (!objects.length) {
+        throw new NotFoundException();
+      }
+
+      const record = objects[0];
+
+      const relation = await this.relationRepository.findOne({ where: { toId: record.id } });
+
+      if (relation) {
+        await this.relationRepository.update(relation.id, { isDeleted: true });
+      }
+
       await this.dataSource.manager
         .createQueryBuilder()
         .delete()

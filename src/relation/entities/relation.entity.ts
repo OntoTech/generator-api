@@ -25,4 +25,7 @@ export class Relation {
 
   @Column({ name: 'related_object_type' })
   relatedObjectType: string;
+
+  @Column({ default: false, name: 'is_deleted' })
+  isDeleted: boolean;
 }

@@ -39,26 +39,26 @@ export class GeneratorController {
     return this.generatorService.findOne(modelCode, objectCode, nested === 'true');
   }
 
-  @Put(':modelCode/:objectCode')
+  @Put(':tableName/:objectCode')
   update(
-    @Param('modelCode') modelCode: string,
+    @Param('tableName') tableName: string,
     @Param('objectCode') objectCode: string,
     @Body() updateGeneratorDto: UpdateGeneratorDto,
   ) {
-    return this.generatorService.update(modelCode, objectCode, updateGeneratorDto);
+    return this.generatorService.update(tableName, objectCode, updateGeneratorDto);
   }
 
-  @Patch(':modelCode/:objectCode')
+  @Patch(':tableName/:objectCode')
   patch(
-    @Param('modelCode') modelCode: string,
+    @Param('tableName') tableName: string,
     @Param('objectCode') objectCode: string,
     @Body() updateGeneratorDto: UpdateGeneratorDto,
   ) {
-    return this.generatorService.patch(modelCode, objectCode, updateGeneratorDto);
+    return this.generatorService.patch(tableName, objectCode, updateGeneratorDto);
   }
 
-  @Delete(':modelCode/:objectCode')
-  remove(@Param('modelCode') modelCode: string, @Param('objectCode') objectCode: string) {
-    return this.generatorService.remove(modelCode, objectCode);
+  @Delete(':tableName/:objectCode')
+  remove(@Param('tableName') tableName: string, @Param('objectCode') objectCode: string) {
+    return this.generatorService.remove(tableName, objectCode);
   }
 }
