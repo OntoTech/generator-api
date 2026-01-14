@@ -1,5 +1,5 @@
 import { HttpException, Injectable, NotFoundException } from '@nestjs/common';
-import { DataSource, QueryFailedError, QueryRunner, Table } from 'typeorm';
+import { DataSource, QueryFailedError, Repository, Table } from 'typeorm';
 import { Service } from '../service/Service';
 import { env } from '../util/env';
 import { ModelService } from '../model/model.service';
@@ -7,53 +7,102 @@ import { IModel, ModelItem, ValidationResult } from '../util/types';
 import { CreateGeneratorDto } from './dto/create-generator.dto';
 import { UpdateGeneratorDto } from './dto/update-generator.dto';
 import { SearchGeneratorDto } from './dto/search-generator.dto';
+import { RelationService } from '../relation/relation.service';
+import { Relation } from '../relation/entities/relation.entity';
+import { Model } from '../model/entities/model.entity';
 
 @Injectable()
 export class GeneratorService extends Service {
+  private relationRepository: Repository<Relation>;
+
   constructor(
     private dataSource: DataSource,
     private readonly modelService: ModelService,
+    private readonly relationService: RelationService,
   ) {
     super();
+    this.relationRepository = this.dataSource.getRepository(Relation);
   }
 
   async create(modelCode: string, createGeneratorDto: CreateGeneratorDto) {
     const modelData = await this.modelService.findOne(modelCode);
-    const validationResult = await this.validateModelData(modelData.data, createGeneratorDto);
+    const plainObject = {};
 
-    if (!validationResult.isValid) {
-      throw new HttpException(
-        {
-          errors: validationResult.errors,
-        },
-        500,
-      );
+    for (const [key, value] of Object.entries(createGeneratorDto)) {
+      if (typeof value === 'object') {
+        continue;
+      }
+
+      plainObject[key] = value;
     }
 
-    const queryRunner = this.dataSource.createQueryRunner();
-    await queryRunner.connect();
+    const rootModelItem = modelData.data.items.find((item) => item.props.description.includes('root'));
 
-    try {
-      await this.createTableIfNotExists(queryRunner, modelData.code);
-      const result = await this.createRecord(queryRunner, modelData.data, createGeneratorDto);
-      await queryRunner.release();
-      return result;
-    } catch (err) {
-      await queryRunner.release();
-      throw err;
-    }
+    await this.createTable(rootModelItem.props.code);
+
+    const rootObject = await this.createRecord(rootModelItem.props.code, plainObject);
+
+    const walkObject = async (data: any, parentId: string) => {
+      for (const [key, value] of Object.entries(data)) {
+        if (Array.isArray(value)) {
+          const targetModelItem = modelData.data.items.find((item) => item.props.code === key);
+
+          const modelRelation = modelData.data.relations.find(
+            ({ type, to }) => type === 'base:object--object' && to === targetModelItem.id,
+          );
+
+          await this.createTable(targetModelItem.props.code);
+
+          const sourceModelItem = modelData.data.items.find((item) => item.id === modelRelation.from);
+
+          for (const item of value) {
+            const newRecord = await this.createRecord(targetModelItem.props.code, item);
+
+            await this.relationService.create({
+              fromId: parentId,
+              toId: newRecord.id,
+              baseType: sourceModelItem.baseModelItemId,
+              objectType: sourceModelItem.type,
+              relationType: modelRelation.type,
+              relatedBaseType: targetModelItem.baseModelItemId,
+              relatedObjectType: targetModelItem.type,
+            });
+
+            await walkObject(item, newRecord.id);
+          }
+        } else if (typeof value === 'object') {
+          await walkObject(value, parentId);
+        }
+      }
+    };
+
+    await walkObject(createGeneratorDto, rootObject.id);
   }
 
-  async findAll(tableName: string) {
+  async findAll(modelCode: string, nested?: boolean) {
+    const modelData = await this.modelService.findOne(modelCode);
+    const rootModelItem = modelData.data.items.find((item) => item.props.description.includes('root'));
+    const tableName = rootModelItem.props.code;
+
     try {
       const totalRes = await this.dataSource.manager.query(
         `SELECT COUNT(*) FROM ${env.DATABASE_SCHEMA}."${tableName}"`,
       );
 
-      const res = await this.dataSource.manager.query(`SELECT * FROM ${env.DATABASE_SCHEMA}."${tableName}"`);
+      let objects = await this.dataSource.manager.query(`SELECT * FROM ${env.DATABASE_SCHEMA}."${tableName}"`);
+
+      if (nested) {
+        const fullObjects = [];
+
+        for (const object of objects) {
+          fullObjects.push(await this.findNested(object, modelData));
+        }
+
+        objects = fullObjects;
+      }
 
       return {
-        items: res,
+        items: objects,
         total: +totalRes[0].count,
       };
     } catch (err) {
@@ -83,18 +132,39 @@ export class GeneratorService extends Service {
     }
   }
 
-  async findOne(tableName: string, code: string) {
+  async findOne(modelCode: string, code: string, nested?: boolean) {
+    const modelData = await this.modelService.findOne(modelCode);
+
+    const root = modelData.data.items.find((item) => item.props.description.includes('root'));
+
     try {
-      const res = await this.dataSource.manager.query(
-        `SELECT * FROM ${env.DATABASE_SCHEMA}."${tableName}" WHERE code = $1`,
+      const objects = await this.dataSource.manager.query(
+        `SELECT * FROM ${env.DATABASE_SCHEMA}."${root.props.code}" WHERE code = $1`,
         [code],
       );
 
-      if (!res.length) {
+      if (!objects.length) {
         throw new NotFoundException();
       }
 
-      return res[0];
+      const rootObject = objects[0];
+
+      if (nested) {
+        return this.findNested(rootObject, modelData);
+      }
+
+      const { data, ...rest } = rootObject;
+      const resultObject = { ...rest, data: {} };
+
+      for (const item of modelData.data.items) {
+        if (item.props.code.includes('root')) continue;
+
+        if (item.baseType === 'base:attribute' && data.hasOwnProperty(item.props.code)) {
+          resultObject.data[item.props.code] = data[item.props.code];
+        }
+      }
+
+      return resultObject;
     } catch (err) {
       this.log.error({ error: err.message }, 'Error during select record');
 
@@ -104,6 +174,42 @@ export class GeneratorService extends Service {
 
       throw new HttpException(`Error during select record: ${err.message}`, 500);
     }
+  }
+
+  async findNested(root: any, modelData: Model) {
+    const result = { ...root };
+
+    const _findNested = async (object: any) => {
+      const objectId = object.id;
+      const relations = await this.relationRepository.find({ where: { fromId: objectId, isDeleted: false } });
+
+      for (const relation of relations) {
+        const modelItem = modelData.data.items.find(
+          (item) => item.type === relation.relatedObjectType && item.baseModelItemId === relation.relatedBaseType,
+        );
+
+        if (!modelItem) continue;
+
+        const relatedRecords = await this.dataSource.manager.query(
+          `SELECT * FROM ${env.DATABASE_SCHEMA}."${modelItem.props.code}" WHERE id = $1`,
+          [relation.toId],
+        );
+
+        if (!Array.isArray(result.data[modelItem.props.code])) {
+          result.data[modelItem.props.code] = [];
+        }
+
+        const relatedRecord = { ...relatedRecords[0].data, id: relatedRecords[0].id };
+
+        result.data[modelItem.props.code].push(relatedRecord);
+
+        await _findNested(relatedRecord);
+      }
+    };
+
+    await _findNested(root);
+
+    return result;
   }
 
   async update(tableName: string, code: string, updateGeneratorDto: UpdateGeneratorDto) {
@@ -145,6 +251,23 @@ export class GeneratorService extends Service {
 
   async remove(tableName: string, code: string) {
     try {
+      const objects = await this.dataSource.manager.query(
+        `SELECT * FROM ${env.DATABASE_SCHEMA}."${tableName}" WHERE code = $1`,
+        [code],
+      );
+
+      if (!objects.length) {
+        throw new NotFoundException();
+      }
+
+      const record = objects[0];
+
+      const relation = await this.relationRepository.findOne({ where: { toId: record.id } });
+
+      if (relation) {
+        await this.relationRepository.update(relation.id, { isDeleted: true });
+      }
+
       await this.dataSource.manager
         .createQueryBuilder()
         .delete()
@@ -212,7 +335,10 @@ export class GeneratorService extends Service {
     }
   }
 
-  private async createTableIfNotExists(queryRunner: QueryRunner, tableName: string) {
+  async createTable(tableName: string) {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+
     try {
       await queryRunner.createTable(
         new Table({
@@ -230,6 +356,7 @@ export class GeneratorService extends Service {
               name: 'code',
               type: 'varchar',
               isUnique: true,
+              isNullable: true,
             },
             {
               name: 'data',
@@ -250,26 +377,34 @@ export class GeneratorService extends Service {
         }),
         true,
       );
+      await queryRunner.release();
     } catch (e) {
+      await queryRunner.release();
       this.log.error({ error: e.message }, `Error during create table ${tableName}`);
       throw new HttpException(`Error during create table ${tableName}: ${e.message}`, 500);
     }
   }
 
-  private async createRecord(queryRunner: QueryRunner, modelData: IModel, createGeneratorDto: any) {
+  private async createRecord(tableName: string, createGeneratorDto: any) {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+
     try {
-      const res = await queryRunner.manager
+      const result = await queryRunner.manager
         .createQueryBuilder()
         .insert()
-        .into(`${env.DATABASE_SCHEMA}.${modelData.code}`)
-        .values({ data: createGeneratorDto, code: createGeneratorDto.code })
+        .into(`${env.DATABASE_SCHEMA}.${tableName}`)
+        .values({ data: createGeneratorDto, code: createGeneratorDto.code || null })
         .returning('*')
         .execute();
 
+      await queryRunner.release();
+
       return {
-        ...res.raw[0],
+        ...result.raw[0],
       };
     } catch (err) {
+      await queryRunner.release();
       this.log.error({ error: err.message }, 'Error during insert record');
 
       if (err instanceof QueryFailedError && err.driverError.code === '23505') {

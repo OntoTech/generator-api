@@ -6,18 +6,22 @@ export type ValidationResult = {
 export interface ModelItem {
   id: string;
   type: string;
+  baseModelItemId: string;
+  baseType: string;
   props: {
     code: string;
     name?: string;
     description?: string;
-    type?: string;
   };
 }
+
+export type ModelRelationType = 'base:object--object' | 'base:object--attribute';
 
 export interface ModelRelation {
   id: string;
   from: string;
   to: string;
+  type: ModelRelationType;
   props: {
     isRequired?: boolean;
   };

@@ -1,4 +1,5 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { ModelRelationType } from '../../util/types';
 
 class ModelPropsDto {
   @ApiProperty()
@@ -28,6 +29,12 @@ class ModelItemDto {
 
   @ApiProperty()
   props: ModelItemPropsDto;
+
+  @ApiProperty()
+  baseModelItemId: string;
+
+  @ApiProperty()
+  baseType: string;
 }
 
 class ModelRelationPropsDto {
@@ -44,6 +51,9 @@ class ModelRelationDto {
 
   @ApiProperty()
   to: string;
+
+  @ApiProperty()
+  type: ModelRelationType;
 
   @ApiProperty()
   props: ModelRelationPropsDto;
