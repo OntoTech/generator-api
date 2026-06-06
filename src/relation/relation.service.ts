@@ -36,15 +36,19 @@ export class RelationService extends Service {
     return `This action returns all relation`;
   }
 
-  findOne(id: number) {
+  findOne(id: string) {
     return `This action returns a #${id} relation`;
   }
 
-  update(id: number, updateRelationDto: UpdateRelationDto) {
-    return `This action updates a #${id} relation`;
+  async update(id: string, updateRelationDto: UpdateRelationDto) {
+    try {
+      await this.relationRepository.update(id, updateRelationDto);
+    } catch (e) {
+      this.log.error({ error: e.message }, 'Error during updating relation');
+    }
   }
 
-  remove(id: number) {
+  remove(id: string) {
     return `This action removes a #${id} relation`;
   }
 }

@@ -1,4 +1,4 @@
-import { Column, Entity, PrimaryColumn } from 'typeorm';
+import { Column, CreateDateColumn, Entity, PrimaryColumn, UpdateDateColumn } from 'typeorm';
 
 @Entity('relations')
 export class Relation {
@@ -28,4 +28,10 @@ export class Relation {
 
   @Column({ default: false, name: 'is_deleted' })
   isDeleted: boolean;
+
+  @CreateDateColumn({ name: 'created_at', default: () => 'NOW()' })
+  createdAt: string;
+
+  @UpdateDateColumn({ nullable: true, name: 'updated_at' })
+  updatedAt: string;
 }

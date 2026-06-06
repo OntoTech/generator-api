@@ -19,16 +19,16 @@ export class RelationController {
 
   @Get(':id')
   findOne(@Param('id') id: string) {
-    return this.relationService.findOne(+id);
+    return this.relationService.findOne(id);
   }
 
   @Patch(':id')
   update(@Param('id') id: string, @Body() updateRelationDto: UpdateRelationDto) {
-    return this.relationService.update(+id, updateRelationDto);
+    return this.relationService.update(id, updateRelationDto);
   }
 
   @Delete(':id')
   remove(@Param('id') id: string) {
-    return this.relationService.remove(+id);
+    return this.relationService.remove(id);
   }
 }
