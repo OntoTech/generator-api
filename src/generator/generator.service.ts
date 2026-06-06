@@ -1,9 +1,10 @@
 import { HttpException, Injectable, NotFoundException } from '@nestjs/common';
 import { DataSource, QueryFailedError, Repository, Table } from 'typeorm';
+import { randomUUID } from 'crypto';
 import { Service } from '../service/Service';
 import { env } from '../util/env';
 import { ModelService } from '../model/model.service';
-import { IModel, ModelItem, ValidationResult } from '../util/types';
+import { IModel, ModelItem, SearchType, ValidationResult } from '../util/types';
 import { CreateGeneratorDto } from './dto/create-generator.dto';
 import { UpdateGeneratorDto } from './dto/update-generator.dto';
 import { SearchGeneratorDto } from './dto/search-generator.dto';
@@ -29,7 +30,7 @@ export class GeneratorService extends Service {
     const plainObject = {};
 
     for (const [key, value] of Object.entries(createGeneratorDto)) {
-      if (typeof value === 'object') {
+      if (typeof value === 'object' && Array.isArray(value) && typeof value[0] === 'object') {
         continue;
       }
 
@@ -40,23 +41,47 @@ export class GeneratorService extends Service {
 
     await this.createTable(rootModelItem.props.code);
 
-    const rootObject = await this.createRecord(rootModelItem.props.code, plainObject);
+    const { code } = createGeneratorDto;
+
+    const rootObject = await this.createRecord(rootModelItem.props.code, { ...plainObject, code });
 
     const walkObject = async (data: any, parentId: string) => {
       for (const [key, value] of Object.entries(data)) {
         if (Array.isArray(value)) {
           const targetModelItem = modelData.data.items.find((item) => item.props.code === key);
 
+          if (!targetModelItem) {
+            this.log.info(`No target model item found for key: ${key}`);
+            continue;
+          }
+
           const modelRelation = modelData.data.relations.find(
             ({ type, to }) => type === 'base:object--object' && to === targetModelItem.id,
           );
+
+          if (!modelRelation) {
+            this.log.info(
+              `No model relation found for key ${key} (id=${targetModelItem.id}) and type base:object--object`,
+            );
+            continue;
+          }
 
           await this.createTable(targetModelItem.props.code);
 
           const sourceModelItem = modelData.data.items.find((item) => item.id === modelRelation.from);
 
           for (const item of value) {
-            const newRecord = await this.createRecord(targetModelItem.props.code, item);
+            const plainItem = {};
+
+            for (const [key, v] of Object.entries(item)) {
+              if (typeof v === 'object' && Array.isArray(v) && (typeof v[0] === 'object' || !v.length)) {
+                continue;
+              }
+
+              plainItem[key] = v;
+            }
+
+            const newRecord = await this.createRecord(targetModelItem.props.code, plainItem);
 
             await this.relationService.create({
               fromId: parentId,
@@ -70,26 +95,189 @@ export class GeneratorService extends Service {
 
             await walkObject(item, newRecord.id);
           }
-        } else if (typeof value === 'object') {
+        } else if (typeof value === 'object' && value !== null) {
           await walkObject(value, parentId);
         }
       }
     };
 
     await walkObject(createGeneratorDto, rootObject.id);
+
+    return rootObject;
   }
 
-  async findAll(modelCode: string, nested?: boolean) {
+  async findAll(
+    modelCode: string,
+    nested?: boolean,
+    page?: number,
+    size?: number,
+    sortColumn?: string,
+    sortOrder?: 'ASC' | 'DESC',
+    filters?: Record<string, any>,
+  ) {
     const modelData = await this.modelService.findOne(modelCode);
     const rootModelItem = modelData.data.items.find((item) => item.props.description.includes('root'));
     const tableName = rootModelItem.props.code;
 
+    const pageNum = page ?? 1;
+    const pageSize = size ?? 10;
+    const sortCol = sortColumn ?? 'created_at';
+    const sortOrd = sortOrder ?? 'DESC';
+    const offset = (pageNum - 1) * pageSize;
+
     try {
+      let whereClause = '';
+      const params: any[] = [];
+
+      const buildCondition = (key: string, filterValue: any): { condition: string; params: any[] } => {
+        const localParams: any[] = [];
+        const isCondition = filterValue && typeof filterValue === 'object' && 'op' in filterValue;
+        const op = isCondition ? filterValue.op : 'eq';
+        const value = isCondition ? filterValue.value : filterValue;
+
+        switch (op) {
+          case 'eq':
+            localParams.push(value);
+            return { condition: `data->>'${key}' = $${localParams.length}`, params: localParams };
+          case 'ne':
+            localParams.push(value);
+            return {
+              condition: `(data->>'${key}' IS NULL OR data->>'${key}' != $${localParams.length})`,
+              params: localParams,
+            };
+          case 'gt':
+            localParams.push(value);
+            return { condition: `(data->>'${key}')::numeric > $${localParams.length}`, params: localParams };
+          case 'gte':
+            localParams.push(value);
+            return { condition: `(data->>'${key}')::numeric >= $${localParams.length}`, params: localParams };
+          case 'lt':
+            localParams.push(value);
+            return { condition: `(data->>'${key}')::numeric < $${localParams.length}`, params: localParams };
+          case 'lte':
+            localParams.push(value);
+            return { condition: `(data->>'${key}')::numeric <= $${localParams.length}`, params: localParams };
+          case 'between':
+            if (Array.isArray(value) && value.length === 2) {
+              localParams.push(value[0]);
+              localParams.push(value[1]);
+              return {
+                condition: `(data->>'${key}')::numeric BETWEEN $${localParams.length - 1} AND $${localParams.length}`,
+                params: localParams,
+              };
+            }
+            return { condition: '1=0', params: [] };
+          case 'like':
+            localParams.push(value);
+
+            return { condition: `data->>'${key}' LIKE $${localParams.length}`, params: localParams };
+          case 'ilike':
+            localParams.push(value);
+            return { condition: `data->>'${key}' ILIKE $${localParams.length}`, params: localParams };
+          case 'in':
+            if (Array.isArray(value)) {
+              const placeholders = value.map((_, i) => `$${localParams.length + i + 1}`).join(',');
+              return { condition: `data->>'${key}' IN (${placeholders})`, params: value };
+            }
+            return { condition: '1=0', params: [] };
+          case 'contains':
+            if (Array.isArray(value)) {
+              return {
+                condition: `data->'${key}' @> $${localParams.length + 1}::jsonb`,
+                params: [JSON.stringify(value)],
+              };
+            }
+            return { condition: '1=0', params: [] };
+          case 'overlap':
+            if (Array.isArray(value)) {
+              return { condition: `data->'${key}' ?| $${localParams.length + 1}::text[]`, params: value };
+            }
+            return { condition: '1=0', params: [] };
+          default:
+            return { condition: '1=1', params: [] };
+        }
+      };
+
+      const processFilters = (filterObj: Record<string, any>, conditions: string[], baseParamIndex: number): number => {
+        let paramIndex = baseParamIndex;
+
+        for (const [key, filterValue] of Object.entries(filterObj)) {
+          if (key === '$and' && Array.isArray(filterValue)) {
+            const groupConditions: string[] = [];
+            for (const item of filterValue) {
+              const groupResult = processFilters(item, groupConditions, paramIndex);
+              paramIndex = groupResult;
+            }
+            if (groupConditions.length > 0) {
+              conditions.push(`(${groupConditions.join(' AND ')})`);
+            }
+          } else if (key === '$or' && Array.isArray(filterValue)) {
+            const groupConditions: string[] = [];
+            for (const item of filterValue) {
+              const groupResult = processFilters(item, groupConditions, paramIndex);
+              paramIndex = groupResult;
+            }
+            if (groupConditions.length > 0) {
+              conditions.push(`(${groupConditions.join(' OR ')})`);
+            }
+          } else if (key === '$not') {
+            const notConditions: string[] = [];
+            const notResult = processFilters(filterValue, notConditions, paramIndex);
+            paramIndex = notResult;
+            if (notConditions.length > 0) {
+              conditions.push(`NOT (${notConditions.join(' AND ')})`);
+            }
+          } else if (filterValue && typeof filterValue === 'object' && !Array.isArray(filterValue)) {
+            const result = buildCondition(key, filterValue);
+            const offsetParams = result.params.map((_, i) => `$${paramIndex + i + 1}`);
+            let condition = result.condition;
+            for (let i = 0; i < offsetParams.length; i++) {
+              condition = condition.replace(`$${i + 1}`, offsetParams[i]);
+            }
+            params.push(...result.params);
+            paramIndex += result.params.length;
+            conditions.push(condition);
+          } else {
+            const result = buildCondition(key, filterValue);
+            const offsetParams = result.params.map((_, i) => `$${paramIndex + i + 1}`);
+            let condition = result.condition;
+            for (let i = 0; i < offsetParams.length; i++) {
+              condition = condition.replace(`$${i + 1}`, offsetParams[i]);
+            }
+            params.push(...result.params);
+            paramIndex += result.params.length;
+            conditions.push(condition);
+          }
+        }
+
+        return paramIndex;
+      };
+
+      if (filters && Object.keys(filters).length > 0) {
+        const conditions: string[] = [];
+        processFilters(filters, conditions, 0);
+        whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+      }
+
       const totalRes = await this.dataSource.manager.query(
-        `SELECT COUNT(*) FROM ${env.DATABASE_SCHEMA}."${tableName}"`,
+        `SELECT COUNT(*) FROM ${env.DATABASE_SCHEMA}."${tableName}" ${whereClause}`,
+        params,
       );
 
-      let objects = await this.dataSource.manager.query(`SELECT * FROM ${env.DATABASE_SCHEMA}."${tableName}"`);
+      const sortColumnName = ['created_at', 'updated_at', 'code'].includes(sortCol)
+        ? `"${sortCol}"`
+        : `data->>'${sortCol}'`;
+
+      const query = `
+        SELECT *
+        FROM ${env.DATABASE_SCHEMA}."${tableName}"
+        ${whereClause}
+        ORDER BY ${sortColumnName} ${sortOrd}
+        LIMIT $${params.length + 1} OFFSET $${params.length + 2}
+      `;
+      const queryParams = [...params, pageSize, offset];
+
+      let objects = await this.dataSource.manager.query(query, queryParams);
 
       if (nested) {
         const fullObjects = [];
@@ -104,6 +292,9 @@ export class GeneratorService extends Service {
       return {
         items: objects,
         total: +totalRes[0].count,
+        page: pageNum,
+        size: pageSize,
+        totalPages: Math.ceil(+totalRes[0].count / pageSize),
       };
     } catch (err) {
       this.log.error({ error: err.message }, 'Error during select all records');
@@ -113,13 +304,23 @@ export class GeneratorService extends Service {
 
   async search(modelCode: string, searchGeneratorDto: SearchGeneratorDto[]) {
     try {
-      const res = await this.dataSource.manager.query(`SELECT * FROM ${env.DATABASE_SCHEMA}."${modelCode}"`);
+      const records = await this.dataSource.manager.query(`SELECT * FROM ${env.DATABASE_SCHEMA}."${modelCode}"`);
       let searchItems = [];
 
       searchGeneratorDto.forEach((search) => {
-        const found = res.filter((item: Record<string, any>) => item.data[search.attributeName] === search.searchQuery);
+        let foundItems: Record<string, any>[] = [];
 
-        searchItems = [...searchItems, ...found];
+        if (search.searchType === SearchType.Exact) {
+          foundItems = records.filter(
+            (item: Record<string, any>) => item.data[search.attributeName] === search.searchQuery,
+          );
+        } else if (search.searchType === SearchType.Fuzzy) {
+          foundItems = records.filter((item: Record<string, any>) =>
+            new RegExp(search.searchQuery, 'i').test(item.data[search.attributeName]),
+          );
+        }
+
+        searchItems = [...searchItems, ...foundItems];
       });
 
       return {
@@ -176,11 +377,55 @@ export class GeneratorService extends Service {
     }
   }
 
+  async findOneById(modelCode: string, id: string, nested?: boolean) {
+    const modelData = await this.modelService.findOne(modelCode);
+
+    const root = modelData.data.items.find((item) => item.props.description.includes('root'));
+
+    try {
+      const objects = await this.dataSource.manager.query(
+        `SELECT * FROM ${env.DATABASE_SCHEMA}."${root.props.code}" WHERE id = $1`,
+        [id],
+      );
+
+      if (!objects.length) {
+        throw new NotFoundException();
+      }
+
+      const rootObject = objects[0];
+
+      if (nested) {
+        return this.findNested(rootObject, modelData);
+      }
+
+      const { data, ...rest } = rootObject;
+      const resultObject = { ...rest, data: {} };
+
+      for (const item of modelData.data.items) {
+        if (item.props.code.includes('root')) continue;
+
+        if (item.baseType === 'base:attribute' && data.hasOwnProperty(item.props.code)) {
+          resultObject.data[item.props.code] = data[item.props.code];
+        }
+      }
+
+      return resultObject;
+    } catch (err) {
+      this.log.error({ error: err.message }, 'Error during select record');
+
+      if (err instanceof NotFoundException) {
+        throw err;
+      }
+
+      throw new HttpException(`Error during select record: ${err.message}`, 500);
+    }
+  }
+
   async findNested(root: any, modelData: Model) {
     const result = { ...root };
 
-    const _findNested = async (object: any) => {
-      const objectId = object.id;
+    const _findNested = async (parent: any) => {
+      const objectId = parent.id;
       const relations = await this.relationRepository.find({ where: { fromId: objectId, isDeleted: false } });
 
       for (const relation of relations) {
@@ -195,58 +440,310 @@ export class GeneratorService extends Service {
           [relation.toId],
         );
 
-        if (!Array.isArray(result.data[modelItem.props.code])) {
-          result.data[modelItem.props.code] = [];
+        if (!parent.data) {
+          parent.data = {};
+        }
+
+        if (!Array.isArray(parent.data[modelItem.props.code])) {
+          parent.data[modelItem.props.code] = [];
         }
 
         const relatedRecord = { ...relatedRecords[0].data, id: relatedRecords[0].id };
 
-        result.data[modelItem.props.code].push(relatedRecord);
+        parent.data[modelItem.props.code].push(relatedRecord);
 
         await _findNested(relatedRecord);
       }
     };
 
-    await _findNested(root);
+    await _findNested(result);
 
     return result;
   }
 
-  async update(tableName: string, code: string, updateGeneratorDto: UpdateGeneratorDto) {
-    const queryRunner = this.dataSource.createQueryRunner();
-    await queryRunner.connect();
+  async update(modelCode: string, objectCode: string, updateGeneratorDto: UpdateGeneratorDto) {
+    const modelData = await this.modelService.findOne(modelCode);
+    const plainObject = {};
 
-    try {
-      await queryRunner.manager
-        .createQueryBuilder()
-        .update(`${env.DATABASE_SCHEMA}.${tableName}`)
-        .set({ data: updateGeneratorDto, updated_at: new Date() })
-        .where('code = :code', { code })
-        .execute();
-    } catch (err) {
-      this.log.error({ error: err.message }, 'Error during update record');
-      throw new HttpException(`Error during update record: ${err.message}`, 500);
+    for (const [key, value] of Object.entries(updateGeneratorDto)) {
+      if (typeof value === 'object') {
+        continue;
+      }
+
+      plainObject[key] = value;
     }
+
+    const rootModelItem = modelData.data.items.find((item) => item.props.description.includes('root'));
+
+    const existingRoot = await this.dataSource.manager.query(
+      `SELECT * FROM ${env.DATABASE_SCHEMA}."${rootModelItem.props.code}" WHERE code = $1`,
+      [objectCode],
+    );
+
+    if (!existingRoot.length) {
+      throw new NotFoundException();
+    }
+
+    const rootObject = existingRoot[0];
+
+    await this.dataSource.manager
+      .createQueryBuilder()
+      .update(`${env.DATABASE_SCHEMA}.${rootModelItem.props.code}`)
+      .set({ data: { ...rootObject.data, ...plainObject }, updated_at: new Date() })
+      .where('code = :code', { code: objectCode })
+      .execute();
+
+    const walkAndUpdate = async (data: any, parentId: string) => {
+      for (const [key, value] of Object.entries(data)) {
+        if (Array.isArray(value)) {
+          const targetModelItem = modelData.data.items.find((item) => item.props.code === key);
+          if (!targetModelItem) continue;
+
+          const modelRelation = modelData.data.relations.find(
+            ({ type, to }) => type === 'base:object--object' && to === targetModelItem.id,
+          );
+          if (!modelRelation) continue;
+
+          const sourceModelItem = modelData.data.items.find((item) => item.id === modelRelation.from);
+          const tableName = targetModelItem.props.code;
+          const processedIds = new Set<string>();
+
+          for (const item of value) {
+            const plainItem = {};
+            for (const [k, v] of Object.entries(item)) {
+              if (k === 'id') continue;
+              if (typeof v === 'object' && Array.isArray(v) && (typeof v[0] === 'object' || !v.length)) continue;
+              if (typeof v === 'object' && !Array.isArray(v) && v !== null) continue;
+              plainItem[k] = v;
+            }
+
+            let existingRecord: any = null;
+
+            if (item.id) {
+              const rows = await this.dataSource.manager.query(
+                `SELECT * FROM ${env.DATABASE_SCHEMA}."${tableName}" WHERE id = $1`,
+                [item.id],
+              );
+              if (rows.length) existingRecord = rows[0];
+            }
+            console.log('find record in', tableName, item, existingRecord);
+
+            if (existingRecord) {
+              processedIds.add(existingRecord.id);
+              const { code: _code, ...dataFields } = plainItem as any;
+
+              await this.dataSource.manager
+                .createQueryBuilder()
+                .update(`${env.DATABASE_SCHEMA}.${tableName}`)
+                .set({ data: { ...existingRecord.data, ...dataFields }, updated_at: new Date() })
+                .where('id = :id', { id: existingRecord.id })
+                .execute();
+
+              const existingRelation = await this.relationRepository.findOne({
+                where: { fromId: parentId, toId: existingRecord.id, isDeleted: false },
+              });
+              if (!existingRelation) {
+                const deletedRelation = await this.relationRepository.findOne({
+                  where: { fromId: parentId, toId: existingRecord.id, isDeleted: true },
+                });
+                if (deletedRelation) {
+                  await this.relationService.update(deletedRelation.id, { isDeleted: false });
+                } else {
+                  await this.relationService.create({
+                    fromId: parentId,
+                    toId: existingRecord.id,
+                    baseType: sourceModelItem.baseModelItemId,
+                    objectType: sourceModelItem.type,
+                    relationType: modelRelation.type,
+                    relatedBaseType: targetModelItem.baseModelItemId,
+                    relatedObjectType: targetModelItem.type,
+                  });
+                }
+              }
+
+              await walkAndUpdate(item, existingRecord.id);
+            } else {
+              const newRecord = await this.createRecord(tableName, plainItem);
+              processedIds.add(newRecord.id);
+
+              await this.relationService.create({
+                fromId: parentId,
+                toId: newRecord.id,
+                baseType: sourceModelItem.baseModelItemId,
+                objectType: sourceModelItem.type,
+                relationType: modelRelation.type,
+                relatedBaseType: targetModelItem.baseModelItemId,
+                relatedObjectType: targetModelItem.type,
+              });
+
+              await walkAndUpdate(item, newRecord.id);
+            }
+          }
+
+          const parentRelations = await this.relationRepository.find({
+            where: { fromId: parentId, isDeleted: false },
+          });
+          for (const rel of parentRelations) {
+            if (processedIds.has(rel.toId)) continue;
+            const inTable = await this.dataSource.manager.query(
+              `SELECT id FROM ${env.DATABASE_SCHEMA}."${tableName}" WHERE id = $1`,
+              [rel.toId],
+            );
+            if (inTable.length) {
+              await this.relationService.update(rel.id, { isDeleted: true });
+            }
+          }
+        } else if (typeof value === 'object' && value !== null) {
+          await walkAndUpdate(value, parentId);
+        }
+      }
+    };
+
+    await walkAndUpdate(updateGeneratorDto, rootObject.id);
+
+    return rootObject;
   }
 
-  async patch(modelCode: string, objectCode: string, record: UpdateGeneratorDto) {
-    const objectRecord = await this.findOne(modelCode, objectCode);
+  async patch(modelCode: string, objectCode: string, updateGeneratorDto: UpdateGeneratorDto) {
+    const modelData = await this.modelService.findOne(modelCode);
+    const plainObject = {};
 
-    for (const [key, value] of Object.entries(record)) {
-      objectRecord.data[key] = value;
+    for (const [key, value] of Object.entries(updateGeneratorDto)) {
+      if (typeof value === 'object') {
+        continue;
+      }
+
+      plainObject[key] = value;
     }
 
-    try {
-      await this.dataSource.manager
-        .createQueryBuilder()
-        .update(`${process.env.DATABASE_SCHEMA}.${modelCode}`)
-        .set({ data: objectRecord.data, updated_at: new Date() })
-        .where('code = :code', { code: objectCode })
-        .execute();
-    } catch (err) {
-      this.log.error({ error: err.message }, 'Error during patch record');
-      throw new HttpException(`Error during patch record: ${err.message}`, 500);
+    const rootModelItem = modelData.data.items.find((item) => item.props.description.includes('root'));
+
+    const existingRoot = await this.dataSource.manager.query(
+      `SELECT * FROM ${env.DATABASE_SCHEMA}."${rootModelItem.props.code}" WHERE code = $1`,
+      [objectCode],
+    );
+
+    if (!existingRoot.length) {
+      throw new NotFoundException();
     }
+
+    const rootObject = existingRoot[0];
+
+    await this.dataSource.manager
+      .createQueryBuilder()
+      .update(`${env.DATABASE_SCHEMA}.${rootModelItem.props.code}`)
+      .set({ data: { ...rootObject.data, ...plainObject }, updated_at: new Date() })
+      .where('code = :code', { code: objectCode })
+      .execute();
+
+    const walkAndUpdate = async (data: any, parentId: string) => {
+      for (const [key, value] of Object.entries(data)) {
+        if (Array.isArray(value)) {
+          const targetModelItem = modelData.data.items.find((item) => item.props.code === key);
+          if (!targetModelItem) continue;
+
+          const modelRelation = modelData.data.relations.find(
+            ({ type, to }) => type === 'base:object--object' && to === targetModelItem.id,
+          );
+          if (!modelRelation) continue;
+
+          await this.createTable(targetModelItem.props.code);
+
+          const sourceModelItem = modelData.data.items.find((item) => item.id === modelRelation.from);
+          const tableName = targetModelItem.props.code;
+          const processedIds = new Set<string>();
+
+          for (const item of value) {
+            const plainItem = {};
+            for (const [k, v] of Object.entries(item)) {
+              if (k === 'id') continue;
+              if (typeof v === 'object' && Array.isArray(v) && (typeof v[0] === 'object' || !v.length)) continue;
+              if (typeof v === 'object' && !Array.isArray(v) && v !== null) continue;
+              plainItem[k] = v;
+            }
+
+            let existingRecord: any = null;
+
+            if (item.id) {
+              const rows = await this.dataSource.manager.query(
+                `SELECT * FROM ${env.DATABASE_SCHEMA}."${tableName}" WHERE id = $1`,
+                [item.id],
+              );
+              if (rows.length) existingRecord = rows[0];
+            }
+
+            if (existingRecord) {
+              processedIds.add(existingRecord.id);
+              const { code: _code, ...dataFields } = plainItem as any;
+
+              await this.dataSource.manager
+                .createQueryBuilder()
+                .update(`${env.DATABASE_SCHEMA}.${tableName}`)
+                .set({ data: { ...existingRecord.data, ...dataFields }, updated_at: new Date() })
+                .where('id = :id', { id: existingRecord.id })
+                .execute();
+
+              const existingRelation = await this.relationRepository.findOne({
+                where: { fromId: parentId, toId: existingRecord.id, isDeleted: false },
+              });
+              if (!existingRelation) {
+                const deletedRelation = await this.relationRepository.findOne({
+                  where: { fromId: parentId, toId: existingRecord.id, isDeleted: true },
+                });
+                if (deletedRelation) {
+                  await this.relationService.update(deletedRelation.id, { isDeleted: false });
+                } else {
+                  await this.relationService.create({
+                    fromId: parentId,
+                    toId: existingRecord.id,
+                    baseType: sourceModelItem.baseModelItemId,
+                    objectType: sourceModelItem.type,
+                    relationType: modelRelation.type,
+                    relatedBaseType: targetModelItem.baseModelItemId,
+                    relatedObjectType: targetModelItem.type,
+                  });
+                }
+              }
+
+              await walkAndUpdate(item, existingRecord.id);
+            } else {
+              const newRecord = await this.createRecord(tableName, plainItem);
+              processedIds.add(newRecord.id);
+
+              await this.relationService.create({
+                fromId: parentId,
+                toId: newRecord.id,
+                baseType: sourceModelItem.baseModelItemId,
+                objectType: sourceModelItem.type,
+                relationType: modelRelation.type,
+                relatedBaseType: targetModelItem.baseModelItemId,
+                relatedObjectType: targetModelItem.type,
+              });
+
+              await walkAndUpdate(item, newRecord.id);
+            }
+          }
+
+          const parentRelations = await this.relationRepository.find({
+            where: { fromId: parentId, isDeleted: false },
+          });
+          for (const rel of parentRelations) {
+            if (processedIds.has(rel.toId)) continue;
+            const inTable = await this.dataSource.manager.query(
+              `SELECT id FROM ${env.DATABASE_SCHEMA}."${tableName}" WHERE id = $1`,
+              [rel.toId],
+            );
+            if (inTable.length) {
+              await this.relationService.update(rel.id, { isDeleted: true });
+            }
+          }
+        } else if (typeof value === 'object' && value !== null) {
+          await walkAndUpdate(value, parentId);
+        }
+      }
+    };
+
+    await walkAndUpdate(updateGeneratorDto, rootObject.id);
   }
 
   async remove(tableName: string, code: string) {
@@ -268,12 +765,14 @@ export class GeneratorService extends Service {
         await this.relationRepository.update(relation.id, { isDeleted: true });
       }
 
-      await this.dataSource.manager
+      const deleteResult = await this.dataSource.manager
         .createQueryBuilder()
         .delete()
         .from(`${env.DATABASE_SCHEMA}.${tableName}`)
         .where('code = :code', { code })
         .execute();
+
+      return deleteResult;
     } catch (err) {
       this.log.error({ error: err.message }, 'Error during delete record');
       throw new HttpException(`Error during delete record: ${err.message}`, 500);
@@ -356,7 +855,6 @@ export class GeneratorService extends Service {
               name: 'code',
               type: 'varchar',
               isUnique: true,
-              isNullable: true,
             },
             {
               name: 'data',
@@ -389,12 +887,32 @@ export class GeneratorService extends Service {
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
 
+    const { code, ...data } = createGeneratorDto;
+
+    let recordCode: string;
+
+    if (code) {
+      // check for duplicates
+      const objects = await this.dataSource.manager.query(
+        `SELECT * FROM ${env.DATABASE_SCHEMA}."${tableName}" WHERE code = $1`,
+        [code],
+      );
+
+      if (objects.length > 0) {
+        recordCode = `${code}_${randomUUID().toString()}`;
+      } else {
+        recordCode = code;
+      }
+    } else {
+      recordCode = randomUUID().toString();
+    }
+
     try {
       const result = await queryRunner.manager
         .createQueryBuilder()
         .insert()
         .into(`${env.DATABASE_SCHEMA}.${tableName}`)
-        .values({ data: createGeneratorDto, code: createGeneratorDto.code || null })
+        .values({ data, code: recordCode })
         .returning('*')
         .execute();
 
@@ -405,7 +923,7 @@ export class GeneratorService extends Service {
       };
     } catch (err) {
       await queryRunner.release();
-      this.log.error({ error: err.message }, 'Error during insert record');
+      this.log.error({ error: err.message, data: createGeneratorDto }, `Error during insert record into ${tableName}`);
 
       if (err instanceof QueryFailedError && err.driverError.code === '23505') {
         throw new HttpException(err.driverError.detail, 400);

@@ -39,3 +39,25 @@ export interface IModel {
   items: ModelItem[];
   relations: ModelRelation[];
 }
+
+export enum SearchType {
+  Exact = 'exact',
+  Fuzzy = 'fuzzy',
+}
+
+export interface IUserInfo {
+  surname?: string;
+  logonname?: string;
+  email?: string;
+  firstname?: string;
+  name?: string;
+  family_name?: string;
+  objectGUID?: string;
+  middlename?: string;
+  middle_name?: string;
+  uid?: string;
+  sub?: string;
+  roles?: string[];
+  roleNames?: string[];
+  federalAppBffAuthHeader?: string;
+}
